@@ -105,7 +105,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "bash __HOME__/.claude/statusline-command.sh"
+    "command": "bash __HOME__/.claude/statusline.sh"
   },
   "enabledPlugins": {
     "ralph-loop@claude-plugins-official": true,

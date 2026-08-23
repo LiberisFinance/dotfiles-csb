@@ -1,0 +1,22 @@
+{
+  "verified_on": "2026-08-23",
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "refresh_hint": "run the statusline-pricing-refresh skill (/statusline-pricing-refresh) to update this file",
+  "prices": {
+    "opus-4-8": 5,
+    "opus-4-7": 5,
+    "opus-4-6": 5,
+    "opus-4-5": 5,
+    "opus-4-1": 15,
+    "opus-5": 5,
+    "opus-4": 15,
+    "sonnet-4-6": 3,
+    "sonnet-4-5": 3,
+    "sonnet-5": 2,
+    "sonnet-4": 3,
+    "haiku-4-5": 1,
+    "haiku-3-5": 0.8,
+    "fable-5": 10,
+    "mythos-5": 10
+  }
+}
