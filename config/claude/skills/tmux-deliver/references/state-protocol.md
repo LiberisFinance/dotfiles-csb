@@ -71,16 +71,12 @@ itself. A role sitting at `launched` is a failed launch, not a slow agent —
 if the report never comes, and `await-running` waits longer when an agent is
 legitimately slow to boot.
 
-### `stale`, and why `next-round` no longer writes `running`
+### `stale` — the status for a role that is owed a dispatch
 
-`next-round` used to reset every finished role to `running`. That status was a
-lie in the one case that matters: nothing had been sent to those roles, so unless
-the orchestrator remembered to `send` each of them the delta, the reviewers sat
-idle **forever** while the table reported them working. It is a design defect, not
-a lapse — it was hit twice in one session, on consecutive rounds, by an
-orchestrator that had already recognised the failure once.
-
-Now:
+Opening a round does not give anyone work. A role that finished the previous
+round has nothing in front of it until something is sent to it, and recording
+such a role as `running` would hide the one thing the orchestrator must act on.
+So:
 
 - `next-round` sets finished roles to **`stale`**, which is visibly not `running`.
 - `--feedback-file` makes `next-round` do the whole transition: it dispatches the
@@ -91,8 +87,8 @@ Now:
   clears their `stale`.
 - Any `send --unit … --role …` also clears it, and records `dispatched_round` /
   `dispatched_at` on the role.
-- With no `--feedback-file`, `next-round` still bumps the round (exit 0, as
-  before) but prints a loud warning naming every role it left un-dispatched.
+- With no `--feedback-file`, `next-round` bumps the round and exits 0, but prints
+  a loud warning naming every role it left un-dispatched.
 
 The invariant: **a role is never recorded `running` unless the agent itself said
 so, and a role that is owed a dispatch says `stale` until it gets one.**
@@ -100,8 +96,8 @@ so, and a role that is owed a dispatch says `stale` until it gets one.**
 same fact, and `status` reports it.
 
 A purely informational message (the round-opened notice, a scope amendment) is
-recorded as `notice_round` and deliberately does **not** clear `stale` — telling
-an agent something is not the same as giving it work.
+recorded as `notice_round` and does **not** clear `stale`: telling an agent
+something is not the same as giving it work.
 
 ## Liveness — recorded status vs what the pane is doing
 
@@ -114,8 +110,9 @@ so, at the top and again in the block:
 
 LIVENESS (pane truth, idle threshold 2m)
   greet/implementer  pane=%62 recorded=running  pane_state=idle 14m
-      !! STALLED — recorded 'running' but the pane has shown no output and no busy
-         indicator for 14m. Nothing has been sent to it since round 1 (the unit is on round 2).
+      !! STALLED — recorded 'running' but the pane has shown no output, no busy indicator,
+         no CPU and no change to its worktree for 14m. Nothing has been sent to it since
+         round 1 (the unit is on round 2). Confirm with `probe --unit greet --role implementer`.
   greet/qa           pane=%25 recorded=stale    pane_state=DEAD
       !! DEAD PANE — recorded 'stale' and the pane is gone. No dispatch can land until
          you relaunch with `start-agent --relaunch`.
@@ -125,8 +122,20 @@ LIVENESS (pane truth, idle threshold 2m)
   question. A recorded pane id tmux can no longer resolve prints as `DEAD` and is
   always flagged, whatever the recorded status — including `done` and `stale`.
   Distinct from `no-window`, which means no pane was ever recorded for the role.
-- **Busy** is the CLI's own busy indicator (`esc to interrupt`) — the same signal
-  the launcher uses to confirm a submit was taken. One definition, used everywhere.
+- **Working** takes three independent readings, and any one of them is enough. A
+  role is called stalled only when all three are quiet.
+
+  | Reading | What it is | Trust it because |
+  |---|---|---|
+  | `working (busy)` | the CLI's own busy indicator (`esc to interrupt`) | it is direct — but it is a string the TUI drew, and every such pattern fails toward "looks idle" if the CLI rewords it |
+  | `working (cpu)` | the pane's process tree is burning CPU, as a rate between samples | the process produces it by running. Linux only: off `/proc` this reading is simply absent |
+  | `working (worktree)` / `working (artifact)` | the files the role is responsible for changed | it is the work itself, not a view of it |
+
+  The last one is **role-specific, and must stay that way**: all three roles share
+  one worktree, but a reviewer's contract forbids it from writing there, so an
+  implementer's edits would otherwise read as a wedged reviewer working. An
+  implementer is measured on its worktree, a reviewer on the review file it is
+  composing.
 - **Idle** is time since the pane's fingerprint last changed. The fingerprint
   **drops the composer line entirely**, because both CLIs rotate placeholder hints
   there (`Explain this codebase`, `Improve documentation in @filename`) with no
@@ -139,16 +148,140 @@ LIVENESS (pane truth, idle threshold 2m)
   a run with the watcher up accrues real history. A pane that has died is
   **pruned** from `liveness.json` rather than refreshed, so its last-known
   `changed_at` can never resurface as recent activity.
-- `--idle-threshold` (default 120s) is how long a pane may be quiet, **while
-  showing no busy indicator**, before an active-looking role is called out. A
-  thinking agent shows the indicator, so it never trips.
+- `--idle-threshold` (default 120s) is how long a pane may be quiet, **while none
+  of the three working signals fires**, before an active-looking role is called
+  out. A thinking agent trips none of it.
+- `--deadline` (default 1800s) is the backstop for the failure an idle threshold
+  structurally cannot see: an agent that is genuinely busy, and has been for far
+  longer than the work needs. It is measured from `dispatched_at` and fires
+  however active the role looks.
+- `--report-grace` (default 120s) is how long a role's finished artifact must sit
+  **unchanged** before the role is called out for not having reported. Every
+  contract says write the artifact, then report, so the file always appears a
+  little before the report does; without the grace the flag would fire on every
+  healthy delivery. An agent still composing its summary keeps resetting it.
 - `--no-liveness` skips sampling; the table then says so rather than implying it
   checked.
 
-`watch` emits `ALERT` on entry into a flagged state — dead pane as well as stall —
-and `CLEARED` on exit, one event per transition, not per poll, plus an `ACTION`
-line whenever a unit has `stale` roles. Under `--no-liveness` it says so on the
-first line instead of quietly reporting nothing.
+`watch` emits `ALERT` on entry into a flagged state and `CLEARED` on exit, one
+event per transition, not per poll, plus an `ACTION` line whenever a unit has
+`stale` roles. Under `--no-liveness` it says so on the first line instead of
+quietly reporting nothing.
+
+## Getting news to the orchestrator without polling
+
+`watch` is a poll loop over the state files — not an agent, no model, no tokens.
+Nothing in the system pushes: `report` writes a JSON file and the watcher writes
+a log, so a report reaches the orchestrator only if the orchestrator looks. An
+orchestrator driving a dozen agents will not look, and an agent that reported
+correctly waits anyway.
+
+**Run plain `watch` under the Monitor tool with `persistent: true`.** Monitor
+treats each stdout line as an event delivered to the orchestrator, so every state
+change arrives as it happens without polling and without occupying an
+orchestrator that has other units to drive. `persistent` avoids the 1-hour
+default deadline; a monitor that does time out says
+`[Monitor timed out — re-arm if needed.]`, and you re-arm it.
+
+**Never pass `--exit-on-event` to a monitored watcher.** Monitor ends the watch
+when the command exits, so the pair yields a single event and then silence.
+
+### Fallback: `--exit-on-event`
+
+Where Monitor is unavailable, background the watcher and add `--exit-on-event`,
+then relaunch it every time it exits. The process terminating is the
+notification. It exits on the first thing that needs a decision, printing the
+event and the full status table:
+
+- a role reaching `done`, `blocked` or `failed`
+- `dead-pane`, `agent-exited`, `overdue`, `stalled` or `no-window`
+
+Three things are printed but do **not** exit the watcher, because each occurs in
+the ordinary course of a run and an interruption that fires every round is one
+the reader learns to ignore. Under Monitor they arrive as ordinary events like
+any other line; on the fallback path they wait in the log until the next event
+brings you back:
+
+- `not-dispatched` — the orchestrator creates it itself by opening a round. It
+  prints as an `ACTION` line, and the next `send` or `re-review` clears it.
+- `unreported-work` — a lagging report, not a stopped agent. It prints as an
+  `ALERT`; read the artifact when you get to it.
+- `launched` → `running` — progress rather than a decision.
+
+### The acknowledgement file
+
+This exists for the fallback path only. A relaunched watcher cannot hold "have I
+already told the orchestrator about this?" in memory, so it is written to
+`watch-ack.json` and read before the first poll. That is what makes the relaunch
+loop safe in both directions: a report that lands during a relaunch is still
+announced, and one already announced is not announced twice.
+
+Only `--exit-on-event` touches the file. A watcher under Monitor never restarts
+and so never needs it, and a plain `watch` outside Monitor notifies nobody — so
+neither may mark anything as delivered.
+
+Do not hand-edit `watch-ack.json`; deleting it makes the next watcher re-announce
+everything currently settled or flagged, which is the correct way to recover if
+you lose track.
+
+## Detecting an agent that fails silently
+
+The reporting contract only covers an agent that is working well enough to choose
+to report. Three failures escape it, so three checks run that do not depend on the
+agent's cooperation at all. They are evaluated **before** anything that reads the
+screen, because each is a fact rather than an inference:
+
+| Flag | What it means | How it is known |
+|---|---|---|
+| `DEAD PANE` | the window is gone | `list-panes` cannot resolve the pane id |
+| `AGENT EXITED` | the CLI process terminated | the launching shell wrote its exit code to `exits/<unit>-<role>.exit` |
+| `UNREPORTED WORK` | the work is done and the report never came | the artifact the role was told to write has sat **unchanged** for `--report-grace`, while its status is still active |
+
+- **`UNREPORTED WORK` is the answer to "it finished but didn't tell me".** The
+  orchestrator computes the artifact path itself when it builds the prompt
+  (`deliveries/<unit>-r<N>.md`, `reviews/<unit>-r<N>-<role>.md`), so a finished
+  file sitting there means the contract was met and only the report is missing.
+  **Read the artifact and carry on. Do not relaunch** — a fresh process would
+  redo work that is already on disk and lose the context that produced it.
+- **`AGENT EXITED` covers the crash no instruction can.** An agent killed by an API
+  error or an OOM cannot report `failed` — it no longer exists. But it was launched
+  from a shell that outlives it, and `start-agent` wraps the CLI so that shell
+  records the exit code and time. The record is cleared at every launch, so a
+  stale crash is never attributed to a fresh process.
+- **`OVERDUE`** is the weakest of the set and comes last: it says only that a role
+  has been active past `--deadline`, not what is wrong with it. Read the pane or
+  `probe` before acting on it.
+
+`progress.json` holds the artifact and worktree observations, keyed by
+`<unit>/<role>` — kept apart from `liveness.json` because it survives a pane being
+replaced. A signal that cannot be read on a given poll (a `git status` losing the
+race with the agent's own `git commit`) carries its last known value forward
+rather than counting as a change.
+
+## Probing a suspect agent
+
+Every passive signal can be wrong: a pane is quiet while an agent reads, and CPU
+is flat while it waits on the API. `probe` settles it by asking a question only a
+working agent can answer — it pastes a one-line request to run
+`report --status running --message "heartbeat <nonce>"` and waits for that nonce
+to appear in the role's state.
+
+```bash
+... probe --unit greet --role implementer          # exits 11 if unanswered
+```
+
+- It **refuses to run on a role that is not flagged** unless given `--force`. The
+  request costs the agent a little context, so it is a confirmation step, not a
+  poll.
+- It **refuses outright on a role that has already reported** `done`, `blocked` or
+  `failed`, `--force` or not: the heartbeat is a `running` report, which would drag
+  a settled role back into an active status and overwrite the message it reported
+  with. Read its artifact instead.
+- A pane that will not even accept the paste is reported as `UNDELIVERABLE` with
+  the same stuck verdict — a pane that cannot take input has answered the question.
+- On a dead pane it says so and stops, rather than reporting a silent agent.
+- `ANSWERED` means the symptom was a false alarm and the agent is fine. Leave it
+  alone.
 
 ## Proof of receipt
 
@@ -176,6 +309,7 @@ final third, where the acceptance criteria and the "do NOT touch" list live.
 | 8 | Enter did not submit; the text may still be sitting in the composer |
 | 9 | the agent never self-reported within `--wait-running` / `await-running --timeout`, or `re-review` found a reviewer with no live window (the others were still dispatched) |
 | 10 | an agent quoted a receipt token that is not its launch's |
+| 11 | `probe` got no answer from the agent, or the pane refused the request |
 
 Codes 2 (`next-round` escalation) and 3 (`verify-readonly` side effects) are
 unchanged.
@@ -186,7 +320,9 @@ unchanged.
 python3 ~/.claude/skills/tmux-deliver/scripts/tmux_deliver.py watch --state-dir .tmux-deliver
 ```
 
-Run this under the **Monitor** tool. Each emitted line is a change:
+Run it under the Monitor tool with `persistent: true`, or on the fallback path
+background it with `--exit-on-event` — see "Getting news to the orchestrator
+without polling" above. Each emitted line is a change:
 
 ```
 unit=retry-policy status=reviewed round=1 implementer=done qa=done/concerns adversarial=done/block title=... message=...
@@ -198,8 +334,19 @@ plus, from the liveness sampler:
   ACTION unit=retry-policy awaiting_dispatch=qa,adversarial — round 2 was opened but nothing
          has been sent to these roles; they will sit idle until you `send` or `re-review`
 ALERT unit=retry-policy role=qa recorded=running pane=%13 alive=True busy=False idle=5m ::
-      STALLED — recorded 'running' but the pane has shown no output and no busy indicator for 5m.
+      STALLED — recorded 'running' but the pane has shown no output, no busy indicator, no CPU
+      and no change to its review file for 5m. Confirm with `probe --unit retry-policy --role qa`.
 CLEARED unit=retry-policy role=qa recorded=running pane=%13 — the pane and the recorded status agree again
+```
+
+and, on the fallback path only, on the way out:
+
+```
+EVENT retry-policy implementer=done
+watch=exiting (--exit-on-event); relaunch it after handling this.
+
+--- status at exit ---
+  retry-policy/implementer           pane=%62    recorded=done      pane_state=idle 3s
 ```
 
 Trust these events — but only as far as they go. The watcher reports what agents
@@ -257,10 +404,10 @@ signature of the interruption it exists to report.
   every agent window with it while the unit files still name the old pane ids, so
   "does this pane exist" has to be answered correctly. `display-message -p -t %24
   '#{pane_id}'` exits **0** on a pane that is gone (measured on tmux 3.4; `-t %24
-  'X#{pane_id}X'` prints `XX`) — it expands the format against nothing. Trusting
-  that made every pane lost to a restart report `alive`, `idle 0s`, and the hash
-  of an empty capture, under the line `no contradictions`. `list-panes -t %24`
-  exits **1** with `can't find pane: %24`, so liveness probes with that.
+  'X#{pane_id}X'` prints `XX`) — it expands the format against nothing. Trust it
+  and every pane lost to a restart reads back as `alive`, `idle 0s`, carrying the
+  hash of an empty capture, under the line `no contradictions`. Use
+  `list-panes -t %24`, which exits **1** with `can't find pane: %24`.
 - **Un-submitted prompts.** Enter is sent only once the payload is fully accounted
   for in the pane, and the launcher then confirms the CLI actually took the message
   (a busy indicator, or at minimum a redraw), retries Enter once, and fails with

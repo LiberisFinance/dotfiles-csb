@@ -100,11 +100,38 @@ integration worktree, and their original branch never moves.
 the user it is scratch state and offer to add it to `.git/info/exclude` (local, not
 a repo change) — do not add it to their tracked `.gitignore` unless they ask.
 
-Then start the watcher with the **Monitor** tool, in the background:
+Then start the watcher under the **Monitor** tool, `persistent: true`:
 
 ```bash
 python3 ~/.claude/skills/tmux-deliver/scripts/tmux_deliver.py watch --state-dir .tmux-deliver
 ```
+
+Monitor treats **each stdout line as an event delivered to you**, so every state
+change reaches you as it happens, for the whole session, without you polling and
+without blocking you from driving the other units. Nothing else in this system
+pushes: `report` writes a JSON file and `watch` writes to a log you would have to
+remember to read — and across a run with a dozen agents you will not.
+
+**Do not pass `--exit-on-event` to a monitored watcher.** Monitor ends the watch
+when the command exits, so the two together give you one event and then silence.
+Use `--exit-on-event` only on the fallback path below.
+
+**If the Monitor tool is unavailable**, background the watcher with the `Bash`
+tool and add `--exit-on-event`:
+
+```bash
+python3 ~/.claude/skills/tmux-deliver/scripts/tmux_deliver.py watch \
+  --state-dir .tmux-deliver --exit-on-event
+```
+
+It then exits on the first role that settles (`done`/`blocked`/`failed`) or the
+first liveness flag needing a decision, printing the event and the full status
+table, so the process finishing is the notification. **Relaunch it every time it
+exits** — that loop is the whole mechanism, and a missed relaunch is a missed
+report.
+
+**Never substitute "I will check back later" for either.** A report that lands
+while you are busy elsewhere is invisible until something tells you.
 
 Every line it emits is a unit/role state change. Trust it as the source of truth
 for progress — but understand what it cannot tell you. The watcher reports what
@@ -112,20 +139,19 @@ agents report, and an agent that never received its prompt reports nothing at
 all: the unit sits at `launched`, which the *launcher* wrote, and the watcher
 stays silent because nothing changed.
 
-That gap is now covered from the other side: the watcher also samples the panes
-and emits `ALERT` when a role recorded as working has a pane that has been idle,
-with no busy indicator, past `--idle-threshold` (default 120s), and `ACTION` when
-a unit has roles nothing has been dispatched to. **Act on those lines.** They
-exist because a status table that agrees with itself is not evidence.
+The pane sampler covers that gap from the other side. It emits `ALERT` when a role
+recorded as working shows none of the working signals past `--idle-threshold`
+(default 120s), and `ACTION` when a unit has roles nothing has been dispatched to.
+**Act on those lines.** A status table that agrees with itself is not evidence.
 
 If you are attached to a different session from the run's, mirror the windows so
 the user can see them — see §7.
 
-**Verifying a launch is not babysitting.** `start-agent` now does it for you: it
-waits for the CLI's composer before pasting, checks the prompt landed before
-pressing Enter, confirms the submission, and then blocks until the agent
-self-reports `running`. If any of that fails it exits **non-zero** with the pane
-tail attached. So:
+**Verifying a launch is not babysitting.** `start-agent` does it for you: it waits
+for the CLI's composer before pasting, checks the prompt landed before pressing
+Enter, confirms the submission, and then blocks until the agent self-reports
+`running`. If any of that fails it exits **non-zero** with the pane tail attached.
+So:
 
 - **Read `start-agent`'s exit code and output.** `agent_status=running` and
   `receipt_check=verified` mean the agent has the whole brief. Anything else
@@ -186,8 +212,9 @@ For each unit, in dependency order, respecting the concurrency cap:
    agent never got its prompt — fix that first; do not wait for a delivery that
    is not coming.
 
-   Then wait for the watcher to report `implementer=done` (unit status
-   `delivered`), and read `.tmux-deliver/deliveries/<unit>-r<N>.md`.
+   Then carry on with other units. The watcher tells you when the implementer
+   settles (unit status `delivered`); read `.tmux-deliver/deliveries/<unit>-r<N>.md`
+   at that point.
 
 3. **Review (parallel).** Launch both reviewers **in one shell command** so they
    run concurrently, each in its own window on Sol/xhigh:
@@ -197,8 +224,9 @@ For each unit, in dependency order, respecting the concurrency cap:
    ... start-agent --unit retry-policy --role adversarial --round 1
    ```
 
-   Wait for unit status `reviewed` (both reviewers done), then read both files in
-   `.tmux-deliver/reviews/<unit>-r<N>-*.md`.
+   Then carry on with other units. Each reviewer settling is its own watcher
+   event; when the second one lands the unit reads `reviewed`. Read both files in
+   `.tmux-deliver/reviews/<unit>-r<N>-*.md` at that point.
 
 4. **Verify the reviewers behaved.** Reviewers launch with unrestricted execution
    so they can run tests, and their contract forbids touching the worktree.
@@ -227,19 +255,19 @@ For each unit, in dependency order, respecting the concurrency cap:
          --message "round 1 rejected: 2 blocking findings"
      ```
 
-     `--feedback-file` is not optional in practice. It sends the change request
-     to the implementer **and** shows both reviewers what was asked for, in one
-     step, because the step that keeps getting skipped is the one that is
-     separate. Without it the round still bumps, but every finished role is left
-     `stale` — visibly un-tasked — and the command says so loudly.
+     **Always pass `--feedback-file`.** It sends the change request to the
+     implementer **and** shows both reviewers what was asked for in one step; a
+     separate second step is one you will skip. Without it the round still bumps,
+     but every finished role is left `stale` — visibly un-tasked — and the command
+     says so loudly.
 
      Keep the same windows alive so the implementer and both reviewers retain
      context. Be explicit and imperative — "apply these exact changes now" — and
      verify the working tree yourself rather than trusting the reply.
 
-7. **Re-review.** When the implementer reports done again, dispatch the delta to
-   **both** reviewer windows — the same ones, which remember round N-1 and can
-   judge whether their findings were actually addressed:
+7. **Re-review.** On the watcher event that says the implementer is done again,
+   dispatch the delta to **both** reviewer windows — the same ones, which remember
+   round N-1 and can judge whether their findings were actually addressed:
 
    ```bash
    ... re-review --unit retry-policy --file .tmux-deliver/messages/retry-policy-r2-delta.md
@@ -258,10 +286,10 @@ contract forbids, and a good reviewer refuses — which costs you a round-trip a
 looks like a stall. `send` and `re-review` refuse implementer-shaped text aimed at
 a reviewer and point you at `re-review` (`--anyway` overrides).
 
-Having been burned by a forgotten dispatch, the tempting rule is "always send to
-all three". That is wrong in a new way. The rule is: **every role that is owed
-something gets something, and each gets the right thing.** `next-round
---feedback-file` and `re-review` encode exactly that.
+Do not simplify this to "always send to all three" — that trades a forgotten
+dispatch for a wrong one. The rule is: **every role that is owed something gets
+something, and each gets the right thing.** `next-round --feedback-file` and
+`re-review` encode exactly that.
 
 **Mid-round scope changes go in the brief, never only in a message.** If an
 implementer reports `blocked` and you authorise files outside its original scope,
@@ -399,19 +427,37 @@ rather than guessing.
   something; it has not acknowledged) and `stale` (you have sent it nothing since
   the round bumped — it is idle and it is waiting on *you*).
 - **The recorded status is bookkeeping; the pane is the fact.** `status` samples
-  both and prints a `LIVENESS` block — alive/dead, busy/idle, time since the pane
-  last changed — and shouts where the two disagree. Read it. Two consecutive
-  rounds were lost to a table that said `running` about reviewers nobody had
-  tasked. `--no-liveness` turns sampling off; it then says so rather than
+  both and prints a `LIVENESS` block — alive/dead, working/idle, time since the
+  pane last changed — and shouts where the two disagree. Read it: a role recorded
+  `running` that nobody has tasked will sit there forever, and only this block
+  says so. `--no-liveness` turns sampling off; it then says so rather than
   implying it checked.
 - **`DEAD` means the pane is gone** (usually a tmux server restart, which takes
   every agent window at once); `no-window` means none was ever recorded. Both
   need `start-agent --relaunch` — neither is a slow agent.
+- **An agent can fail without saying so; three flags catch it without its help.**
+  - `AGENT EXITED` — the CLI process terminated and the launching shell recorded
+    the exit code. An agent killed by an API error cannot report `failed`, so this
+    is the only way you learn. Relaunch it.
+  - `UNREPORTED WORK` — the artifact it was told to write has sat unchanged for
+    `--report-grace` (2m) while its status still says active. The work is done and
+    only the report is missing: **read the artifact, do not relaunch.** This one
+    alerts without exiting the watcher, because it is a late report rather than a
+    stopped agent.
+  - `OVERDUE` — active past `--deadline` (30m) however busy it looks, the one case
+    an idle threshold cannot see. It says only that the role is taking too long;
+    read the pane or `probe` before acting.
+- **When a signal is ambiguous, `probe` it rather than guessing.**
+  `probe --unit <u> --role <r>` asks the agent to run one report command and waits
+  for it; unanswered is a real diagnosis, answered means the symptom was a false
+  alarm. It refuses to disturb a role that is not flagged unless you pass
+  `--force`, and refuses a role that has already reported under any circumstances.
 - **Never read the composer line as evidence.** Both CLIs render rotating
   placeholder hints there ("Explain this codebase", "Improve documentation in
-  @filename"), so a pane can look alive with nothing running. The busy indicator
-  and changes in output above the composer are the honest signals, and they are
-  what the liveness check uses.
+  @filename"), so a pane can look alive with nothing running. Liveness weighs two
+  further signals no TUI change can break — the CPU the pane's process tree burns,
+  and changes to the files that role is responsible for — and calls a role stalled
+  only when all three are quiet.
 - **Reviewer windows are per-unit and long-lived** by design — killing them
   between rounds throws away the context that makes re-review worth anything.
 - After an interruption, run `recover` before doing anything else: it reports

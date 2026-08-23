@@ -239,20 +239,28 @@ tmux unlink-window -t <user-session>:<idx>                   # put it back
 
 ## Reading a pane: what is evidence and what is not
 
-The liveness check in `status` / `watch` (see `state-protocol.md`) rests on two
-signals, and deliberately excludes a third:
+The liveness check in `status` / `watch` (see `state-protocol.md`) weighs what a
+pane shows like this:
 
 | Signal | Verdict |
 |---|---|
 | busy indicator (`esc to interrupt`) | **evidence** — the CLI is working |
 | output above the composer changing | **evidence** — the agent produced something |
 | composer line contents | **never evidence** |
+| footer / status line beneath the composer | **never evidence** |
 
 Both CLIs render rotating placeholder hints in the composer (`Explain this
 codebase`, `Improve documentation in @filename`), so an abandoned pane can look
 busy to anything that reads that line. The footer beneath it mutates on its own
 too: measured on Claude Code 2.1.229, it flips between `⏸ manual mode on · ? for
 shortcuts · ← for agents` and `⏸ manual mode on` with no agent involved.
+
+Everything in that table is a string a TUI drew, so **do not let it be the only
+thing you check**. Two readings taken outside the pane carry the same weight —
+the CPU the pane's process tree burns, and changes to the files the role is
+responsible for — and a role is called stalled only when all of them are quiet.
+The CPU reading comes from `/proc` and is simply absent on platforms without it,
+which leaves that role on two signals rather than three.
 
 `pane_fingerprint()` therefore cuts the pane at the composer and hashes only what
 is above it, minus spinner, timer and token-counter lines. Verified against a live

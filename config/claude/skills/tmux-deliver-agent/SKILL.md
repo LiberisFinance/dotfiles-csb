@@ -144,10 +144,19 @@ prompt.
 | after reading the brief and planning | `running` (with `--receipt`) |
 | the moment you need orchestrator input, or an assumption proves false | `blocked` |
 | you cannot proceed and have no useful next action | `failed` |
+| a tool, command or API call keeps failing on you | `failed` |
 | summary written and verification handled | `done` |
+
+Your prompt gives you all four commands literally. Use them; a chat message
+describing your situation is not a report and the orchestrator will not see it.
 
 Report `blocked` **early**. A blocked report costs the orchestrator seconds; a wrong
 guess costs a whole review round.
+
+**Silence is the one failure that costs the most.** The orchestrator can detect a
+window that vanished, a process that exited, and work you finished without saying
+so — but each of those wastes a cycle it did not need to spend. If you are stuck,
+degraded, or repeatedly hitting errors, say so and stop.
 
 ## After reporting done
 

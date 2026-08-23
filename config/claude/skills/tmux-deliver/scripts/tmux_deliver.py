@@ -102,6 +102,9 @@ ROLE_REPORTABLE = {"running", "done", "blocked", "failed"}
 # Statuses that assert "this role has work in front of it right now" — the ones a
 # dead or long-idle pane contradicts.
 ROLE_ACTIVE = {"launched", "notified", "running"}
+# Statuses that end a role's turn and hand the decision back to the orchestrator.
+# Reaching one is the event a watcher exits on; `launched` to `running` is not.
+ROLE_SETTLED = {"done", "blocked", "failed"}
 # Dispatching to a role clears these; `running` is left alone (the agent owns it).
 ROLE_DISPATCH_CLEARS = {"stale", "done", "blocked"}
 VERDICTS = {"pass", "concerns", "block"}
@@ -114,6 +117,7 @@ EXIT_PASTE_INCOMPLETE = 7
 EXIT_NOT_SUBMITTED = 8
 EXIT_NOT_RUNNING = 9
 EXIT_RECEIPT_MISMATCH = 10
+EXIT_PROBE_UNANSWERED = 11
 
 # --- pane signatures --------------------------------------------------------
 # Observed on codex-cli 0.147.0 and Claude Code 2.1.228. If a CLI changes its
@@ -178,6 +182,51 @@ PANE_VOLATILE_PATTERNS = [
 IDLE_THRESHOLD = 120.0
 LIVENESS_FILE = "liveness.json"
 
+# Observations of the work itself — artifact files, commits, worktree churn —
+# rather than of the window the work happens in. Kept apart from liveness.json
+# because it is keyed by unit/role and survives a pane being replaced.
+PROGRESS_FILE = "progress.json"
+
+# What the watcher has already told the orchestrator about. Persisted, because a
+# watcher run with --exit-on-event is relaunched constantly and in-memory state
+# would either lose every report that lands during a relaunch or re-fire on every
+# report it has already delivered.
+WATCH_ACK_FILE = "watch-ack.json"
+
+# Where a launched CLI's exit status lands. A crashed agent cannot report
+# `failed`; the shell it was launched from can, and does.
+EXITS_DIR = "exits"
+
+# How long a role may stay in an active status before it is called out, however
+# busy it looks (seconds). This is the backstop for the failure the idle
+# threshold cannot see: an agent that is genuinely spinning, forever.
+ROUND_DEADLINE = 1800.0
+
+# How settled an artifact must be before its role is called out for not having
+# reported (seconds). Every contract says write the artifact, then report, so the
+# file always appears first; without this grace the flag fires on every healthy
+# delivery. Measured from the artifact's last modification, so an agent still
+# writing to it never trips.
+ARTIFACT_GRACE = 120.0
+
+# CPU consumption that counts as "this process is doing something", as a fraction
+# of one core sustained between two samples. A rate, not a total: samples are
+# taken at whatever interval the caller polls at, so an absolute delta would mean
+# different things at 3s and 15s.
+CPU_BUSY_RATE = 0.02
+# Below this many seconds between samples the rate is too noisy to trust.
+CPU_MIN_INTERVAL = 1.0
+
+# Flags an exiting watcher wakes the orchestrator for. Two are left out because
+# they fire in the ordinary course of a run and would train the reader to ignore
+# the notification: `not-dispatched`, which the orchestrator creates itself by
+# opening a round, and `unreported-work`, which is a lagging report rather than a
+# stopped agent. Both still print as ACTION and ALERT lines.
+EXIT_WORTHY_FLAGS = {"dead-pane", "agent-exited", "overdue", "stalled", "no-window"}
+
+# How long `probe` waits for an agent to answer a direct heartbeat request.
+PROBE_TIMEOUT = 90.0
+
 # Heading `extend-scope` writes into a brief. Reviewers are told to look for it.
 SCOPE_AMENDMENT_HEADING = "## SCOPE AMENDMENT"
 
@@ -232,7 +281,7 @@ def state_path(raw: str | Path) -> Path:
 
 
 def ensure_state_dirs(state_dir: Path) -> None:
-    for name in ["units", "briefs", "prompts", "deliveries", "reviews", "messages"]:
+    for name in ["units", "briefs", "prompts", "deliveries", "reviews", "messages", EXITS_DIR]:
         (state_dir / name).mkdir(parents=True, exist_ok=True)
 
 
@@ -501,6 +550,278 @@ def pane_fingerprint(target: str, pane: str) -> str:
     return hashlib.sha1(("\n".join(kept) + f"|history={history}").encode()).hexdigest()[:16]
 
 
+# --- evidence that does not come from reading the screen ---------------------
+#
+# Everything above this point infers "is the agent working" from what the TUI
+# drew — brittle, version-specific, and failing toward "looks idle". The three
+# signals below do not read the screen at all: the CLI process's own CPU
+# consumption, the files the work is supposed to produce, and the exit status of
+# the process when it stops. A silent failure has to defeat all of them.
+
+
+def exit_record_path(state_dir: Path, unit_id: str, role: str) -> Path:
+    return state_dir / EXITS_DIR / f"{slug(unit_id)}-{role}.exit"
+
+
+def clear_exit_record(state_dir: Path, unit_id: str, role: str) -> None:
+    """Drop any exit status from a previous launch of this role.
+
+    Called at launch, so that the presence of the file afterwards always refers
+    to the process running now. Without this a relaunch would inherit the old
+    crash and report a healthy agent as dead.
+    """
+    exit_record_path(state_dir, unit_id, role).unlink(missing_ok=True)
+
+
+def read_exit_record(state_dir: Path, unit_id: str, role: str) -> dict[str, Any] | None:
+    """The CLI's exit status, if it has stopped. None while it is still running.
+
+    An agent that dies to an API error, an OOM kill, or a crash cannot report
+    `failed` — it is gone. But it was launched from a shell that outlives it, and
+    that shell records the exit code. This turns the one failure mode no
+    instruction can cover into an ordinary observable fact.
+    """
+    path = exit_record_path(state_dir, unit_id, role)
+    if not path.exists():
+        return None
+    raw = path.read_text().strip()
+    if not raw:
+        return None
+    parts = raw.split(None, 1)
+    try:
+        code = int(parts[0])
+    except ValueError:
+        return None
+    return {"code": code, "at": parts[1].strip() if len(parts) > 1 else None}
+
+
+def wrap_with_exit_capture(launch: str, exit_path: Path) -> str:
+    """Make the launching shell record how the CLI terminated.
+
+    Deliberately a shell-level append rather than anything the agent has to do:
+    it holds for a crash, a kill, and a clean exit alike, and an agent that has
+    stopped existing cannot be relied on to describe its own death.
+    """
+    quoted = shlex.quote(str(exit_path))
+    return f"{launch}; printf '%s %s\\n' \"$?\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {quoted}"
+
+
+def _proc_cpu_table() -> dict[int, tuple[int, int]] | None:
+    """{pid: (ppid, cpu_ticks)} for every visible process, or None off Linux.
+
+    Read from /proc in one pass rather than shelling out to `ps`, whose CPU-time
+    column format varies by platform and truncates to whole seconds.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    table: dict[int, tuple[int, int]] = {}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue  # the process exited while we were walking; not an error
+        # comm is parenthesised and may itself contain spaces, so split on the
+        # last ')' rather than tokenising the whole line.
+        close = stat.rfind(")")
+        if close < 0:
+            continue
+        fields = stat[close + 2 :].split()
+        if len(fields) < 13:
+            continue
+        try:
+            table[int(entry.name)] = (int(fields[1]), int(fields[11]) + int(fields[12]))
+        except ValueError:
+            continue
+    return table
+
+
+def pane_cpu_seconds(target: str) -> float | None:
+    """CPU seconds consumed by the pane's process tree, or None if unavailable.
+
+    The pane's own shell is cheap; the CLI and whatever it spawns are not. Summed
+    across the whole subtree so a test run or a build counts as the agent working.
+
+    This is the honest version of the busy indicator: a number the process
+    produces by running, not a string the TUI happens to be drawing. A wedged
+    agent stops accumulating it; a thinking one does not.
+    """
+    if not target:
+        return None
+    table = _proc_cpu_table()
+    if not table:
+        return None
+    root = run_tmux(["display-message", "-p", "-t", target, "#{pane_pid}"], check=False, capture=True)
+    if root.returncode != 0 or not root.stdout.strip().isdigit():
+        return None
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+
+    total = 0
+    stack = [int(root.stdout.strip())]
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen or pid not in table:
+            continue
+        seen.add(pid)
+        total += table[pid][1]
+        stack.extend(children.get(pid, ()))
+    ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    return total / float(ticks or 100)
+
+
+def expected_artifact(unit: dict[str, Any], role: str, state_dir: Path, round_no: int) -> Path:
+    """The file this role is contracted to write this round.
+
+    The orchestrator computes this path itself when it builds the prompt, so it
+    knows where to look without the agent telling it anything — which is what
+    makes "the artifact is there but the role never reported" a fact rather than
+    an inference.
+    """
+    if role in REVIEW_ROLES:
+        return state_dir / "reviews" / f"{unit['id']}-r{round_no}-{role}.md"
+    return state_dir / "deliveries" / f"{unit['id']}-r{round_no}.md"
+
+
+def worktree_signature(worktree: str | None) -> str | None:
+    """A hash that changes whenever the working tree does.
+
+    `git status --porcelain` alone is not enough: it reports *which* files are
+    modified, not their contents, so an agent editing the same file over and over
+    would look frozen. Folding in each listed path's size and mtime fixes that,
+    and staying inside the porcelain list keeps it O(changed files) rather than a
+    walk of the repo.
+    """
+    if not worktree:
+        return None
+    path = Path(worktree)
+    if not path.is_dir():
+        return None
+    status = run_git(["-C", str(path), "status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        return None
+    head = run_git(["-C", str(path), "rev-parse", "HEAD"], check=False)
+    parts = [head.stdout.strip(), status.stdout]
+    for line in status.stdout.splitlines():
+        name = line[3:].strip().strip('"')
+        if not name:
+            continue
+        try:
+            stat = (path / name).stat()
+        except OSError:
+            continue
+        parts.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:16]
+
+
+def artifact_signature(artifact: Path) -> str | None:
+    """Size and mtime of a role's output file, or None if it is not there yet.
+
+    A reviewer never writes to the worktree — its contract forbids it — so the
+    file it is composing is the only trace its work leaves outside its pane.
+    """
+    try:
+        stat = artifact.stat()
+    except OSError:
+        return None
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def progress_signals(unit: dict[str, Any], role: str, artifact: Path) -> dict[str, str | None]:
+    """The observable traces this role's work leaves, by name.
+
+    Role-specific on purpose. All three roles share one worktree, so crediting a
+    reviewer with the implementer's edits would report a wedged reviewer as
+    working. Implementers change the tree; reviewers only ever grow their review
+    file.
+
+    A `None` value means "could not read it this time", which is not the same as
+    "unchanged" and must not be compared as if it were — `git status` loses races
+    against the agent's own `git commit`.
+    """
+    signals: dict[str, str | None] = {"artifact": artifact_signature(artifact)}
+    if role not in REVIEW_ROLES:
+        signals["worktree"] = worktree_signature(unit.get("worktree"))
+    return signals
+
+
+def sample_work_progress(
+    state_dir: Path, unit: dict[str, Any], role: str, round_no: int
+) -> dict[str, Any]:
+    """What the work looks like from outside the window.
+
+    Two questions the pane cannot answer. Has this role produced the artifact it
+    was told to produce, and how long ago did it stop touching it — which together
+    settle "finished but never reported" without guessing. And has anything the
+    role is responsible for changed since we last looked — which says the agent is
+    working even while its pane is silent.
+    """
+    artifact = expected_artifact(unit, role, state_dir, round_no)
+    signals = progress_signals(unit, role, artifact)
+    now = time.time()
+
+    store_path = state_dir / PROGRESS_FILE
+    store = read_json(store_path, {})
+    if not isinstance(store, dict):
+        store = {}
+    key = f"{unit['id']}/{role}"
+    entry = store.get(key) or {}
+    known = entry.get("signals") if isinstance(entry.get("signals"), dict) else {}
+
+    # Carry an unreadable signal forward at its last known value rather than
+    # letting it read as a change, then back again on the next poll.
+    merged = dict(known)
+    changed_names = []
+    for name, value in signals.items():
+        if value is None:
+            continue
+        if name in known and known[name] != value:
+            changed_names.append(name)
+        merged[name] = value
+
+    first_seen = entry.get("first_seen", now)
+    if changed_names or "changed_at" not in entry:
+        entry = {"changed_at": now, "first_seen": first_seen}
+    entry["signals"] = merged
+    entry["seen_at"] = now
+    store[key] = entry
+    write_json(store_path, store)
+
+    artifact_stamp = signals["artifact"]
+    return {
+        "artifact": artifact,
+        "artifact_exists": artifact_stamp is not None,
+        # Age of the artifact's last write, so a file still being composed is not
+        # mistaken for a finished one whose report went missing. Taken from the
+        # signature already read, rather than a second stat that could race.
+        "artifact_age": (
+            max(0.0, now - int(artifact_stamp.split(":")[1]) / 1e9)
+            if artifact_stamp is not None
+            else None
+        ),
+        "work_changed": bool(changed_names),
+        "work_signal": changed_names[0] if changed_names else None,
+    }
+
+
+def unobserved_pane(target: str | None) -> dict[str, Any]:
+    """A liveness reading for a pane there is nothing to read: absent or dead."""
+    return {
+        "pane": target or None,
+        "alive": False,
+        "busy": False,
+        "cpu_busy": False,
+        "cpu": None,
+        "cpu_rate": None,
+        "idle": None,
+        "observed_for": 0.0,
+    }
+
+
 def sample_pane_liveness(state_dir: Path, target: str) -> dict[str, Any]:
     """Observe a pane now, and say how long it has been unchanged.
 
@@ -511,7 +832,7 @@ def sample_pane_liveness(state_dir: Path, target: str) -> dict[str, Any]:
     cannot be mistaken for a long silence.
     """
     if not target:
-        return {"pane": None, "alive": False, "busy": False, "idle": None, "observed_for": 0.0}
+        return unobserved_pane(None)
 
     store_path = state_dir / LIVENESS_FILE
     store = read_json(store_path, {})
@@ -523,19 +844,35 @@ def sample_pane_liveness(state_dir: Path, target: str) -> dict[str, Any]:
         # from recent activity, so a dead pane would read back as "idle 0s".
         if store.pop(target, None) is not None:
             write_json(store_path, store)
-        return {"pane": target, "alive": False, "busy": False, "idle": None, "observed_for": 0.0}
+        return unobserved_pane(target)
 
     pane = capture_pane(target)
     fingerprint = pane_fingerprint(target, pane)
+    cpu = pane_cpu_seconds(target)
     now = time.time()
 
-    entry = store.get(target) or {}
+    previous = store.get(target) or {}
+    entry = previous
     if entry.get("fingerprint") != fingerprint:
         entry = {
             "fingerprint": fingerprint,
             "changed_at": now,
             "first_seen": entry.get("first_seen", now),
         }
+    # CPU is carried across fingerprint changes: it measures the process, not the
+    # screen, and the two move independently. Compared as a rate over the actual
+    # gap between samples, because callers poll at anything from 3s to minutes and
+    # the same absolute delta means different things at each. A first observation
+    # has no prior reading and so never counts as activity.
+    previous_cpu = previous.get("cpu")
+    previous_seen = previous.get("seen_at")
+    cpu_rate = None
+    if cpu is not None and previous_cpu is not None and previous_seen is not None:
+        gap = now - float(previous_seen)
+        if gap >= CPU_MIN_INTERVAL:
+            cpu_rate = max(0.0, (cpu - float(previous_cpu)) / gap)
+    cpu_busy = cpu_rate is not None and cpu_rate >= CPU_BUSY_RATE
+    entry["cpu"] = cpu
     entry["seen_at"] = now
     entry["changed_at_iso"] = dt.datetime.fromtimestamp(
         entry["changed_at"], dt.timezone.utc
@@ -547,6 +884,9 @@ def sample_pane_liveness(state_dir: Path, target: str) -> dict[str, Any]:
         "pane": target,
         "alive": True,
         "busy": pane_is_busy(pane),
+        "cpu_busy": cpu_busy,
+        "cpu": cpu,
+        "cpu_rate": cpu_rate,
         "idle": max(0.0, now - float(entry["changed_at"])),
         "observed_for": max(0.0, now - float(entry["first_seen"])),
         "last_change": entry["changed_at_iso"],
@@ -574,12 +914,44 @@ def liveness_threshold(args: argparse.Namespace) -> float:
     return IDLE_THRESHOLD if threshold is None else threshold
 
 
+def liveness_deadline(args: argparse.Namespace) -> float:
+    """`--deadline` from `args`, defaulting only when it was never set.
+
+    Same `None`-not-falsy rule as the idle threshold: 0 means "every active role
+    is overdue", which is a legitimate way to list everything still in flight.
+    """
+    deadline = getattr(args, "deadline", None)
+    return ROUND_DEADLINE if deadline is None else deadline
+
+
+def liveness_grace(args: argparse.Namespace) -> float:
+    """`--report-grace` from `args`, defaulting only when it was never set."""
+    grace = getattr(args, "report_grace", None)
+    return ARTIFACT_GRACE if grace is None else grace
+
+
+def role_elapsed(role_state: dict[str, Any]) -> float | None:
+    """Seconds since this role was last dispatched, or None if never / unparseable."""
+    stamp = role_state.get("dispatched_at") or role_state.get("launched_at")
+    if not stamp:
+        return None
+    try:
+        when = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, dt.datetime.now(dt.timezone.utc).timestamp() - when.timestamp())
+
+
 def role_liveness(
     state_dir: Path,
     unit: dict[str, Any],
     role: str,
     *,
     threshold: float = IDLE_THRESHOLD,
+    deadline: float = ROUND_DEADLINE,
+    grace: float = ARTIFACT_GRACE,
 ) -> dict[str, Any]:
     """Recorded status vs what the pane is doing, and the contradiction between them.
 
@@ -593,9 +965,7 @@ def role_liveness(
     unit_round = unit.get("round") or 0
     dispatched = role_state.get("dispatched_round")
 
-    info = sample_pane_liveness(state_dir, pane) if pane else {
-        "pane": None, "alive": False, "busy": False, "idle": None, "observed_for": 0.0
-    }
+    info = sample_pane_liveness(state_dir, pane) if pane else unobserved_pane(None)
     info.update({"unit": unit["id"], "role": role, "recorded": recorded, "dispatched_round": dispatched})
 
     if unit.get("status") in UNIT_TERMINAL:
@@ -604,6 +974,17 @@ def role_liveness(
         info["flag"] = None
         info["flag_kind"] = None
         return info
+
+    progress = sample_work_progress(state_dir, unit, role, unit_round)
+    info.update(progress)
+    info["exit"] = read_exit_record(state_dir, unit["id"], role)
+    info["elapsed"] = role_elapsed(role_state)
+
+    # "Working" takes three independent readings and any one is enough. Only the
+    # busy indicator is a string the TUI drew, so a CLI that changes its wording
+    # cannot on its own turn a healthy agent into a stall.
+    working = bool(info["busy"] or info.get("cpu_busy") or info.get("work_changed"))
+    info["working"] = working
 
     flag = None
     # A stable reason code alongside the human sentence. `watch` dedupes on this,
@@ -618,6 +999,47 @@ def role_liveness(
         flag = (
             f"DEAD PANE — recorded {recorded or '-'!r} and the pane is gone. No dispatch can land "
             "until you relaunch with `start-agent --relaunch`."
+        )
+    elif info["exit"] is not None and recorded in ROLE_ACTIVE:
+        # Second, and also a fact rather than a reading: the shell that launched
+        # the CLI recorded it terminating. An agent killed by an API error or an
+        # OOM never got to report `failed`, and its pane looks merely quiet.
+        code = info["exit"]["code"]
+        when = f" at {info['exit']['at']}" if info["exit"].get("at") else ""
+        kind = "agent-exited"
+        flag = (
+            f"AGENT EXITED — recorded {recorded!r}, but the CLI process terminated{when} with exit "
+            f"code {code}. It cannot report anything now. Relaunch with `start-agent --relaunch`"
+            + (
+                f"; its round-{unit_round} artifact was written, so re-brief from that."
+                if info["artifact_exists"]
+                else "."
+            )
+        )
+    elif (
+        recorded in ROLE_ACTIVE
+        and info["artifact_exists"]
+        # Every contract says write the artifact, then report, so the file always
+        # appears a little before the report. Wait for it to stop changing: an
+        # agent still composing its summary is delivering, not silent.
+        and (info["artifact_age"] or 0.0) >= grace
+    ):
+        # Third: the work is finished and the bookkeeping does not know. The
+        # orchestrator computed this path itself when it built the prompt, so the
+        # file sitting there untouched means the contract was met and only the
+        # report is missing.
+        kind = "unreported-work"
+        nudge = (
+            f"`re-review --unit {unit['id']}`"
+            if role in REVIEW_ROLES
+            else f"`send --unit {unit['id']} --role {role}`"
+        )
+        flag = (
+            f"UNREPORTED WORK — recorded {recorded!r}, but the round-{unit_round} artifact it was "
+            f"told to write has sat unchanged at {info['artifact']} for "
+            f"{human_duration(info['artifact_age'])}. The work looks done and the report never "
+            f"arrived. Read the artifact, then either ask it to report via {nudge}, or record the "
+            f"outcome yourself."
         )
     elif recorded == "stale":
         kind = "not-dispatched"
@@ -638,27 +1060,52 @@ def role_liveness(
     elif recorded in ROLE_ACTIVE and not pane:
         kind = "no-window"
         flag = f"NO WINDOW — recorded {recorded!r} but no pane was ever recorded for this role."
-    elif recorded in ROLE_ACTIVE and info["alive"] and not info["busy"]:
+    elif (
+        recorded in ROLE_ACTIVE
+        and info["alive"]
+        and not working
+        # The threshold belongs in the condition, not the body. Inside the body it
+        # would swallow every quiet-but-not-yet-stalled role and stop the checks
+        # below from ever running.
+        and (info["idle"] or 0.0) >= threshold
+    ):
         idle = info["idle"] or 0.0
-        if idle >= threshold:
-            detail = ""
-            if dispatched is not None and unit_round and dispatched < unit_round:
-                detail = (
-                    f" Nothing has been sent to it since round {dispatched} "
-                    f"(the unit is on round {unit_round})."
-                )
-            kind = "stalled"
-            flag = (
-                f"STALLED — recorded {recorded!r} but the pane has shown no output and no busy "
-                f"indicator for {human_duration(idle)}.{detail}"
+        detail = ""
+        if dispatched is not None and unit_round and dispatched < unit_round:
+            detail = (
+                f" Nothing has been sent to it since round {dispatched} "
+                f"(the unit is on round {unit_round})."
             )
+        kind = "stalled"
+        quiet = "review file" if role in REVIEW_ROLES else "worktree"
+        flag = (
+            f"STALLED — recorded {recorded!r} but the pane has shown no output, no busy "
+            f"indicator, no CPU and no change to its {quiet} for {human_duration(idle)}."
+            f"{detail} Confirm with `probe --unit {unit['id']} --role {role}`."
+        )
+    elif recorded in ROLE_ACTIVE and info["elapsed"] is not None and info["elapsed"] >= deadline:
+        # Last, because it is the weakest reading: everything above identifies
+        # *what* went wrong, where this only says it has taken too long. It exists
+        # for the failure the idle threshold structurally cannot see — an agent
+        # that is genuinely busy, and has been for far longer than the work needs.
+        kind = "overdue"
+        flag = (
+            f"OVERDUE — recorded {recorded!r} and still working {human_duration(info['elapsed'])} "
+            f"after being dispatched (deadline {human_duration(deadline)}). Nothing here says it is "
+            f"broken; it may be looping. Check the pane, or `probe --unit {unit['id']} --role {role}`."
+        )
     info["flag"] = flag
     info["flag_kind"] = kind
     return info
 
 
 def collect_liveness(
-    state_dir: Path, units: list[dict[str, Any]], *, threshold: float = IDLE_THRESHOLD
+    state_dir: Path,
+    units: list[dict[str, Any]],
+    *,
+    threshold: float = IDLE_THRESHOLD,
+    deadline: float = ROUND_DEADLINE,
+    grace: float = ARTIFACT_GRACE,
 ) -> list[dict[str, Any]]:
     rows = []
     for unit in units:
@@ -666,7 +1113,11 @@ def collect_liveness(
             role_state = (unit.get("roles") or {}).get(role) or {}
             if not role_state.get("status") and not role_state.get("pane"):
                 continue
-            rows.append(role_liveness(state_dir, unit, role, threshold=threshold))
+            rows.append(
+                role_liveness(
+                    state_dir, unit, role, threshold=threshold, deadline=deadline, grace=grace
+                )
+            )
     return rows
 
 
@@ -675,8 +1126,14 @@ def format_liveness(row: dict[str, Any]) -> str:
         state = "no-window"
     elif not row["alive"]:
         state = "DEAD"
+    elif row.get("exit") is not None:
+        state = f"EXITED rc={row['exit']['code']}"
+    elif row.get("working"):
+        # Name which signal saw it, so a reader can tell a TUI match from a fact.
+        why = "busy" if row["busy"] else ("cpu" if row.get("cpu_busy") else row.get("work_signal"))
+        state = f"working ({why or 'progress'})"
     else:
-        state = "busy" if row["busy"] else f"idle {human_duration(row['idle'])}"
+        state = f"idle {human_duration(row['idle'])}"
     label = f"{row['unit']}/{row['role']}"
     return (
         f"{label[:34]:<34} pane={(row['pane'] or '-'):<6} "
@@ -1543,10 +2000,18 @@ When your work is done:
 3. Report delivered:
    `{base} --status done --artifact {shlex.quote(str(delivery_file))} --message "Delivered round {round_no}; red-green evidence and verification in the summary."`
 
+If anything goes wrong, report it — these are commands, not descriptions, and
+they are the only way the orchestrator learns you are in trouble:
+  blocked: `{base} --status blocked --message "<what you need>"`
+  failed:  `{base} --status failed --message "<what happened>"`
 Report `blocked` the moment you need orchestrator input, and `failed` if you
-cannot proceed and have no useful next action. Then STOP and wait — the
-orchestrator will send follow-up instructions into this window if changes are
-required. Do not exit; do not start new work on your own initiative.
+cannot proceed and have no useful next action — including when a tool, command
+or API call keeps failing on you. A report costs seconds; silence costs the
+orchestrator the whole round waiting for you.
+
+Then STOP and wait — the orchestrator will send follow-up instructions into this
+window if changes are required. Do not exit; do not start new work on your own
+initiative.
 """
 
 
@@ -1629,6 +2094,14 @@ Write your review to `{review_file}` with these sections:
 
 Then report:
   `{base} --status done --verdict <pass|concerns|block> --artifact {shlex.quote(str(review_file))} --message "<one-line verdict>"`
+
+If anything goes wrong, report it — these are commands, not descriptions, and
+they are the only way the orchestrator learns you are in trouble:
+  blocked: `{base} --status blocked --message "<what you need>"`
+  failed:  `{base} --status failed --message "<what happened>"`
+Report `blocked` the moment you need orchestrator input (a missing persona file,
+an unreadable diff), and `failed` if you cannot proceed and have no useful next
+action — including when a tool, command or API call keeps failing on you.
 
 After reporting, STOP and wait in this window. The orchestrator will send you the
 delta to re-review in later rounds — keep your context so you can judge whether
@@ -1986,7 +2459,13 @@ def command_start_agent(args: argparse.Namespace) -> None:
         {"type": "start-agent", "unit": unit["id"], "role": role, "round": round_no, "pane": pane_id},
     )
 
-    launch = launch_command(**cfg, workspace=workspace)
+    # Clear before launching, never after: an exit file left by the previous
+    # process would otherwise be read as this one having already died.
+    clear_exit_record(state_dir, unit["id"], role)
+    launch = wrap_with_exit_capture(
+        launch_command(**cfg, workspace=workspace),
+        exit_record_path(state_dir, unit["id"], role),
+    )
     send_command(pane_id, launch)
 
     def pane_ready_now() -> tuple[str, str, str]:
@@ -2193,8 +2672,14 @@ def command_status(args: argparse.Namespace) -> None:
     state_dir = state_path(args.state_dir)
     units = load_units(state_dir)
     threshold = liveness_threshold(args)
+    deadline = liveness_deadline(args)
+    grace = liveness_grace(args)
     want_liveness = not getattr(args, "no_liveness", False)
-    rows = collect_liveness(state_dir, units, threshold=threshold) if want_liveness else []
+    rows = (
+        collect_liveness(state_dir, units, threshold=threshold, deadline=deadline, grace=grace)
+        if want_liveness
+        else []
+    )
 
     if args.json:
         print(
@@ -2790,11 +3275,145 @@ def command_await_running(args: argparse.Namespace) -> None:
     print(f"receipt_check={_receipt_report(role_state)}")
 
 
+def command_probe(args: argparse.Namespace) -> None:
+    """Ask a suspect agent to prove it is alive, instead of inferring it.
+
+    Every passive signal can be wrong: a pane can be quiet because the agent is
+    reading, and CPU can be flat because it is waiting on the API. This is the
+    tie-breaker — a request only a working agent can satisfy. It costs the agent
+    a little context, which is why it is not run on every poll.
+    """
+    state_dir = state_path(args.state_dir)
+    meta = load_meta(state_dir)
+    unit = load_unit(state_dir, slug(args.unit))
+    role = args.role
+    if role not in ROLES:
+        die(f"unknown role {role!r}; expected one of {', '.join(ROLES)}")
+    role_state = (unit.get("roles") or {}).get(role) or {}
+    pane = role_state.get("pane")
+    if not pane:
+        die(f"no pane recorded for {unit['id']}/{role}; nothing to probe")
+    if not tmux_target_alive(pane):
+        print(f"unit={unit['id']}\nrole={role}\npane={pane}")
+        print("probe=SKIPPED (pane is gone — this is a dead pane, not a silent agent)")
+        print(f"action=relaunch with `start-agent --unit {unit['id']} --role {role} --relaunch`")
+        raise SystemExit(EXIT_PROBE_UNANSWERED)
+
+    if role_state.get("status") in ROLE_SETTLED:
+        # A probe asks the agent to report `running`, which would drag a role that
+        # has already reported back into an active status and overwrite the message
+        # it reported with. There is nothing to establish about a role that has
+        # already had its say.
+        die(
+            f"{unit['id']}/{role} has already reported {role_state['status']!r}; there is nothing "
+            "to probe. Read its artifact, or dispatch it fresh work."
+        )
+
+    row = role_liveness(
+        state_dir,
+        unit,
+        role,
+        threshold=liveness_threshold(args),
+        deadline=liveness_deadline(args),
+        grace=liveness_grace(args),
+    )
+    if not row["flag"] and not args.force:
+        print(f"unit={unit['id']}\nrole={role}\npane={pane}")
+        print(f"probe=SKIPPED (nothing is wrong with this role: {format_liveness(row)})")
+        print("action=none; pass --force to probe anyway")
+        return
+
+    nonce = uuid.uuid4().hex[:8]
+    script = Path(meta.get("script_path") or Path(__file__).resolve())
+    report = report_command(script, state_dir, unit["id"], role, unit.get("round") or 0)
+    message = (
+        f"Orchestrator liveness check {nonce}. Whatever you are doing, run this now and then "
+        f"carry on exactly where you left off — it changes nothing about your task:\n"
+        f'{report} --status running --message "heartbeat {nonce}"'
+    )
+    options = paste_options(args, meta)
+    print(f"unit={unit['id']}\nrole={role}\npane={pane}\nnonce={nonce}")
+    print(f"symptom={row['flag_kind'] or 'none (forced)'}")
+    try:
+        paste_and_submit(
+            pane,
+            message,
+            state_dir,
+            f"probe-{unit['id']}-{role}",
+            options["delay"],
+            mode="inline",
+            bracketed=options["bracketed"],
+            # Never recover: restarting the pane would destroy the very context we
+            # are trying to establish is still there.
+            recover=None,
+        )
+    except SystemExit as exc:
+        # A pane that will not even accept the request has answered the question
+        # asked. Report it as the probe result rather than as a paste error: the
+        # caller wants a verdict on the agent, not a diagnosis of the delivery.
+        print(f"probe=UNDELIVERABLE (the pane did not accept input; paste exit {exc.code})")
+        print("verdict=the agent is not processing input at all; treat it as stuck")
+        print(f"action=`start-agent --unit {unit['id']} --role {role} --relaunch` (a fresh process; it")
+        print("  loses prior-round context, so re-brief it with the accumulated feedback)")
+        print(f"--- pane tail ---\n{pane_tail(pane, 25)}")
+        raise SystemExit(EXIT_PROBE_UNANSWERED) from None
+
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        time.sleep(args.poll)
+        latest = (load_unit(state_dir, unit["id"]).get("roles") or {}).get(role) or {}
+        if nonce in (latest.get("message") or ""):
+            print(f"probe=ANSWERED in {human_duration(args.timeout - (deadline - time.time()))}")
+            print("verdict=the agent is alive and processing input; the symptom was a false alarm")
+            return
+    print(f"probe=UNANSWERED after {human_duration(args.timeout)}")
+    print("verdict=the agent did not act on a direct instruction; treat it as stuck")
+    print(f"action=`start-agent --unit {unit['id']} --role {role} --relaunch` (a fresh process; it")
+    print("  loses prior-round context, so re-brief it with the accumulated feedback)")
+    print(f"--- pane tail ---\n{pane_tail(pane, 25)}")
+    raise SystemExit(EXIT_PROBE_UNANSWERED)
+
+
+def read_watch_ack(state_dir: Path) -> dict[str, dict[str, str]]:
+    """What the orchestrator has already been notified of.
+
+    Held on disk, not in memory, because a watcher run with `--exit-on-event` is a
+    short-lived process relaunched after every event. In-memory bookkeeping would
+    make each new watcher either re-announce everything it finds — including
+    events already handled — or, if it suppressed its first reading, silently
+    swallow any report that landed while it was being relaunched.
+    """
+    raw = read_json(state_dir / WATCH_ACK_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "settled": raw.get("settled") if isinstance(raw.get("settled"), dict) else {},
+        "flagged": raw.get("flagged") if isinstance(raw.get("flagged"), dict) else {},
+    }
+
+
+def write_watch_ack(state_dir: Path, ack: dict[str, dict[str, str]]) -> None:
+    write_json(state_dir / WATCH_ACK_FILE, ack)
+
+
 def command_watch(args: argparse.Namespace) -> None:
     state_dir = state_path(args.state_dir)
     seen: dict[str, str] = {}
-    flagged: dict[str, str] = {}
+    # `--exit-on-event` turns this poller into a notification: the process
+    # finishing is the signal, so a backgrounded watcher tells its caller without
+    # blocking it. Relaunch it after handling each event.
+    exit_on_event = getattr(args, "exit_on_event", False)
+    pending_exit: list[str] = []
+    # Only an exiting watcher reads or writes the acknowledgement. A plain `watch`
+    # notifies nobody — it writes a log — so letting it mark events as delivered
+    # would let it consume an event that a later exiting watcher owed the caller.
+    ack = read_watch_ack(state_dir) if exit_on_event else {"settled": {}, "flagged": {}}
+    flagged: dict[str, str] = dict(ack["flagged"])
+    settled_seen: dict[str, str] = dict(ack["settled"])
+    ack_dirty = False
     threshold = liveness_threshold(args)
+    deadline = liveness_deadline(args)
+    grace = liveness_grace(args)
     liveness_interval = max(getattr(args, "liveness_interval", None) or 15.0, args.interval)
     next_liveness = 0.0
     if getattr(args, "no_liveness", False):
@@ -2816,7 +3435,9 @@ def command_watch(args: argparse.Namespace) -> None:
         # a stall is a minutes-scale event, not a seconds-scale one.
         if not getattr(args, "no_liveness", False) and time.monotonic() >= next_liveness:
             next_liveness = time.monotonic() + liveness_interval
-            for row in collect_liveness(state_dir, units, threshold=threshold):
+            for row in collect_liveness(
+                state_dir, units, threshold=threshold, deadline=deadline, grace=grace
+            ):
                 key = f"{row['unit']}/{row['role']}"
                 flag = row.get("flag")
                 kind = row.get("flag_kind")
@@ -2831,6 +3452,9 @@ def command_watch(args: argparse.Namespace) -> None:
                         flush=True,
                     )
                     flagged[key] = kind
+                    ack_dirty = True
+                    if exit_on_event and kind in EXIT_WORTHY_FLAGS:
+                        pending_exit.append(f"{kind} on {key}")
                 elif not flag and key in flagged:
                     print(
                         f"CLEARED unit={row['unit']} role={row['role']} recorded={row['recorded']} "
@@ -2838,6 +3462,7 @@ def command_watch(args: argparse.Namespace) -> None:
                         flush=True,
                     )
                     flagged.pop(key, None)
+                    ack_dirty = True
 
         for unit in units:
             roles = unit.get("roles") or {}
@@ -2852,6 +3477,25 @@ def command_watch(args: argparse.Namespace) -> None:
             if seen.get(unit["id"]) == fingerprint:
                 continue
             seen[unit["id"]] = fingerprint
+
+            # A role *reaching* a terminal status is what the orchestrator has to
+            # act on; `launched` to `running` means things are going to plan and
+            # is logged without interrupting anyone. The comparison is against the
+            # on-disk acknowledgement, so a report that landed while this watcher
+            # was being relaunched is still news, and one already announced is not.
+            newly_settled = []
+            for r in ROLES:
+                status = (roles.get(r) or {}).get("status")
+                key = f"{unit['id']}/{r}"
+                if status in ROLE_SETTLED and settled_seen.get(key) != status:
+                    newly_settled.append(f"{r}={status}")
+                    settled_seen[key] = status
+                    ack_dirty = True
+                elif status not in ROLE_SETTLED and key in settled_seen:
+                    settled_seen.pop(key, None)
+                    ack_dirty = True
+            if exit_on_event and newly_settled:
+                pending_exit.append(f"{unit['id']} {' '.join(newly_settled)}")
             role_bits = " ".join(
                 f"{r}={(roles.get(r) or {}).get('status') or '-'}"
                 + (f"/{(roles.get(r) or {}).get('verdict')}" if (roles.get(r) or {}).get("verdict") else "")
@@ -2871,6 +3515,33 @@ def command_watch(args: argparse.Namespace) -> None:
                     f"they will sit idle until you `send` or `re-review`",
                     flush=True,
                 )
+
+        if ack_dirty and exit_on_event:
+            # Persist before any exit: an event announced but not recorded would be
+            # announced again by the next watcher.
+            write_watch_ack(state_dir, {"settled": settled_seen, "flagged": flagged})
+        ack_dirty = False
+
+        if pending_exit:
+            # Print the whole table, not just the trigger: this process exiting is
+            # the notification, so what it leaves on stdout is all the orchestrator
+            # gets before deciding what to do.
+            for event in pending_exit:
+                print(f"\nEVENT {event}", flush=True)
+            print("watch=exiting (--exit-on-event); relaunch it after handling this.", flush=True)
+            if getattr(args, "no_liveness", False):
+                print("status=not shown (--no-liveness)", flush=True)
+                return
+            print("\n--- status at exit ---", flush=True)
+            for row in collect_liveness(
+                state_dir, load_units(state_dir), threshold=threshold, deadline=deadline, grace=grace
+            ):
+                line = format_liveness(row)
+                print(f"  {line}", flush=True)
+                if row.get("flag"):
+                    print(f"      !! {row['flag']}", flush=True)
+            return
+
         time.sleep(args.interval)
 
 
@@ -3047,6 +3718,20 @@ def add_liveness_args(parser: argparse.ArgumentParser) -> None:
         f"as active is called out as stalled (default {IDLE_THRESHOLD:g})",
     )
     parser.add_argument(
+        "--deadline",
+        type=float,
+        default=ROUND_DEADLINE,
+        help=f"seconds a role may stay in an active status, however busy it looks, before it is "
+        f"called out as overdue (default {ROUND_DEADLINE:g})",
+    )
+    parser.add_argument(
+        "--report-grace",
+        type=float,
+        default=ARTIFACT_GRACE,
+        help=f"seconds a role's finished artifact must sit unchanged before the role is called "
+        f"out for not having reported (default {ARTIFACT_GRACE:g})",
+    )
+    parser.add_argument(
         "--no-liveness",
         action="store_true",
         help="do not sample panes; report only what the state files say",
@@ -3200,6 +3885,23 @@ def build_parser() -> argparse.ArgumentParser:
     await_running.add_argument("--poll", type=float, default=3.0)
     await_running.set_defaults(func=command_await_running)
 
+    probe = sub.add_parser(
+        "probe",
+        help="Ask a suspect agent to prove it is alive; non-zero if it does not answer.",
+    )
+    probe.add_argument("--state-dir", default=".tmux-deliver")
+    probe.add_argument("--unit", required=True)
+    probe.add_argument("--role", required=True, choices=list(ROLES))
+    probe.add_argument("--timeout", type=float, default=PROBE_TIMEOUT)
+    probe.add_argument("--poll", type=float, default=3.0)
+    probe.add_argument(
+        "--force",
+        action="store_true",
+        help="probe even if nothing is currently flagged (costs the agent some context)",
+    )
+    add_liveness_args(probe)
+    probe.set_defaults(func=command_probe)
+
     nxt = sub.add_parser(
         "next-round",
         help="Reject the current round, bump the counter, and dispatch the change request.",
@@ -3282,6 +3984,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch.add_argument("--state-dir", default=".tmux-deliver")
     watch.add_argument("--interval", type=float, default=3.0)
+    watch.add_argument(
+        "--exit-on-event",
+        action="store_true",
+        help="exit on the first role that settles (done/blocked/failed) or the first liveness "
+        f"flag that needs a decision ({', '.join(sorted(EXIT_WORTHY_FLAGS))}), printing the status "
+        "table, then relaunch. For callers with no way to consume a running process's output: "
+        "the process exiting is what notifies them. Do NOT combine with a harness that already "
+        "streams stdout as events and ends the watch on exit (Claude Code's Monitor tool) — the "
+        "pair delivers one event and then nothing",
+    )
     watch.add_argument(
         "--liveness-interval",
         type=float,

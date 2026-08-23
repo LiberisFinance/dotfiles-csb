@@ -52,8 +52,16 @@ than stopping. If `report` rejects your token, stop for the same reason.
 3. Report `running` using the command given to you, with `--receipt`.
 
 Report `blocked` the moment you need orchestrator input, and `failed` if you cannot
-proceed and have no useful next action. Report `blocked` **early** — it costs the
-orchestrator seconds, where a wrong guess costs a whole round.
+proceed and have no useful next action — including when a tool, command or API call
+keeps failing on you. Report `blocked` **early** — it costs the orchestrator
+seconds, where a wrong guess costs a whole round. Your prompt gives you all four
+report commands literally; use them, because a chat message describing your
+situation is not a report and the orchestrator will not see it.
+
+**Silence is the one failure that costs the most.** The orchestrator can detect a
+window that vanished, a process that exited, and work you finished without saying
+so — but each of those wastes a cycle it did not need to spend. If you are stuck,
+degraded, or repeatedly hitting errors, say so and stop.
 
 After you report `done`, **stay in this window**. Do not exit and do not start new
 work on your own initiative. The orchestrator pastes follow-up work into this same
