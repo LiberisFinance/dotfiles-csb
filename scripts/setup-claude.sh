@@ -38,19 +38,20 @@ rsync -a "$CLAUDE_SRC/skills/" "$CLAUDE_DIR/skills/"
 # --- Hooks ---
 cp "$CLAUDE_SRC/hooks/langfuse_hook.py" "$CLAUDE_DIR/hooks/langfuse_hook.py"
 
-# --- settings.json: substitute __HOME__ with actual $HOME ---
-# Only write if settings.json does not already exist or differs from template
+# --- settings.json: substitute __HOME__ with actual $HOME, then merge into the
+# live file on every run. Claude Code (and `claude plugin install` below) rewrites
+# settings.json at runtime — permission grants, effort level, feedback state — so a
+# plain "only write if missing" check meant the template only ever applied once,
+# before the CLI got a chance to touch the file. Structural keys (env, permissions,
+# hooks, statusLine, enabledPlugins, extraKnownMarketplaces) are enforced/unioned
+# every run; everything else is seeded once and left for the CLI/user to manage.
 SETTINGS_TEMPLATE="$CLAUDE_SRC/settings.json"
 SETTINGS_TARGET="$CLAUDE_DIR/settings.json"
+SETTINGS_RENDERED="$(mktemp)"
+trap 'rm -f "$SETTINGS_RENDERED"' EXIT
 
-if [ ! -f "$SETTINGS_TARGET" ]; then
-  sed "s|__HOME__|$HOME|g" "$SETTINGS_TEMPLATE" > "$SETTINGS_TARGET"
-  echo "claude: created settings.json"
-else
-  # Re-apply to pick up any changes to the template; merge would be ideal but
-  # Claude Code manages settings.json at runtime so we only write if the target
-  # is missing — update manually when template changes are intentional.
-  echo "claude: settings.json already exists, skipping (delete to re-apply template)"
-fi
+sed "s|__HOME__|$HOME|g" "$SETTINGS_TEMPLATE" > "$SETTINGS_RENDERED"
+python3 "$DOTFILES_DIR/scripts/merge-claude-settings.py" "$SETTINGS_RENDERED" "$SETTINGS_TARGET"
+echo "claude: settings.json synced (dotfiles-managed keys merged)"
 
 echo "claude: configuration applied"
