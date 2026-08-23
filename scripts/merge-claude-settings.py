@@ -9,15 +9,28 @@ feedbackSurveyState, ...) into this file at runtime, and resyncing dotfiles shou
 not stomp on that.
 """
 import json
+import re
 import sys
 
 OVERWRITE_KEYS = {"statusLine", "$schema"}
 
+# Write(<path>) rules are never matched by Claude Code's file permission checks --
+# only Edit(<path>) rules cover file-writing tools. Normalize any stale Write(path)
+# rule (ours or one added by hand) to its Edit(path) equivalent so it actually works.
+WRITE_PATH_RULE = re.compile(r"^Write\((.+)\)$")
 
-def merge_str_list(existing, template):
+
+def normalize_permission_rule(rule):
+    match = WRITE_PATH_RULE.match(rule)
+    return f"Edit({match.group(1)})" if match else rule
+
+
+def merge_str_list(existing, template, normalize=None):
     seen = set()
     result = []
     for item in list(template) + list(existing):
+        if normalize:
+            item = normalize(item)
         if item not in seen:
             seen.add(item)
             result.append(item)
@@ -27,7 +40,9 @@ def merge_str_list(existing, template):
 def merge_permissions(existing, template):
     result = dict(existing)
     for key, template_list in template.items():
-        result[key] = merge_str_list(existing.get(key, []), template_list)
+        result[key] = merge_str_list(
+            existing.get(key, []), template_list, normalize=normalize_permission_rule
+        )
     return result
 
 
